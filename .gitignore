@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# PyInstaller / Build
+build/
+dist/
+*.spec.bak
+tcl_data_extracted/
+tk_data_extracted/
+
+# Sensitive / Local Configuration
+webdav_config.json
+ssl/*.key
+ssl/*.crt
+ssl/
+
+# Temporary / Scratch
+none_test.txt
+repro_error.txt
+scratch_response.html
+error.log
+test_err*.log
+caught_err.log
+server.log
+server_err.log
+.vscode/
+.idea/

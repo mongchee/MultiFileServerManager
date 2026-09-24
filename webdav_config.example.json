@@ -1,0 +1,46 @@
+{
+    "shared_folders": [
+        "C:\\SharedFolder"
+    ],
+    "port": "8080",
+    "username": "admin",
+    "password": "password123!",
+    "auto_start_server": false,
+    "minimize_to_tray": true,
+    "webdav": {
+        "shared_folders": [
+            "C:\\SharedFolder"
+        ],
+        "port": "8080",
+        "username": "admin",
+        "password": "password123!",
+        "auto_start": false,
+        "use_ssl": false
+    },
+    "http": {
+        "shared_folders": [
+            "C:\\SharedFolder"
+        ],
+        "port": "18000",
+        "use_auth": false,
+        "username": "admin",
+        "password": "password123!",
+        "auto_start": false,
+        "use_ssl": false
+    },
+    "ftp": {
+        "shared_folders": [
+            "C:\\SharedFolder"
+        ],
+        "port": "2121",
+        "username": "admin",
+        "password": "password123!",
+        "anonymous": true,
+        "allow_write": true,
+        "auto_start": false
+    },
+    "ssl": {
+        "cert_path": "",
+        "key_path": ""
+    }
+}
