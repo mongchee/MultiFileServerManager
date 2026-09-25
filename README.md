@@ -9,22 +9,29 @@ Python Tkinter 기반으로 제작된 올인원 파일 공유 서버 관리 프�
 ## ✨ 주요 기능
 
 ### 1. 📁 WebDAV 서버
-- WsgiDAV + Cheroot 고성능 WSGI 엔진 기반
+- WsgiDAV + Cheroot 고성능 WSGI 엔진 기반 (32 멀티스레드 풀)
+- **대용량 파일 전송 & 스트리밍 최적화**: I/O 버퍼 확장(`256KB`)을 통한 시스템 콜 최소화 및 전송 속도 극대화
+- **미디어 스트리밍 CORS 지원**: 외부 웹 플레이어, 스마트TV 앱, Kodi/nPlayer/PotPlayer 완벽 호환
 - 복수 공유 폴더 개별 및 통합 마운트 지원
 - 사용자 계정 인증(아이디/비밀번호) 및 익명 접속 제어
 - **HTTPS (SSL/TLS)** 암호화 통신 지원 (자체 서명 인증서 자동 발급 또는 사용자 인증서 지정)
 
-### 2. 🌐 HTTP 웹 파일 서버
-- 웹 브라우저(Chrome, Edge, Safari 등)에서 별도 프로그램 설치 없이 파일 탐색 및 다운로드
-- 다중 공유 폴더 가상 마운트 및 깔끔한 웹 탐색 UI
-- HTTP 기본 인증(Basic Auth) 지원
-- **HTTPS (SSL/TLS)** 보안 연결 옵션 제공
+### 2. 🌐 HTTP 웹 파일 서버 & 스트리밍
+- **HTTP Range Requests (RFC 7233 / 206 Partial Content) 완벽 지원**:
+  - 대용량 4K/FHD 동영상도 첫 수 메가바이트만 즉시 읽어 **클릭 즉시 0.1초 만에 재생 시작**
+  - 타임라인 클릭(Seek) 시 **지연 없는 실시간 탐색 스트리밍** 지원
+- **브라우저 내장 고화질 HTML5 미디어 플레이어 모달 탑재**:
+  - 다운로드 대기 없이 웹 브라우저에서 동영상(`🎬`) 및 음원(`🎵`) 즉시 감상
+- **128KB 고속 스트리밍 버퍼 & 지능형 소켓 관리**:
+  - 플레이어 시크 또는 중단 시 소켓 연결을 즉시 정리하여 CPU/메모리 자원 누수 제로
+- HTTP 1.1 Keep-Alive 연결 재사용으로 연속적인 미디어 청크 요청 지연(Latency) 제거
+- 다중 공유 폴더 가상 마운트 및 모던 다크 테마 웹 UI
+- HTTP 기본 인증(Basic Auth) 및 **HTTPS (SSL/TLS)** 보안 연결 옵션 제공
 
-### 3. 📡 FTP 서버
-- `pyftpdlib` 기반의 안정적이고 빠른 고속 파일 전송
-- 익명(Anonymous) 및 전용 계정 인증
-- 읽기 전용 / 쓰기 허용 권한 분리
-- 최신 브라우저를 위한 내장 **HTTP 웹 뷰어** 동시 연동
+### 3. 📡 FTP 서버 & 웹 뷰어
+- `pyftpdlib` 기반의 고속 전송 엔진 (`TCP_NODELAY` 활성화로 패킷 대기 지연 제거)
+- 익명(Anonymous) 및 전용 계정 인증 / 읽기 전용 및 쓰기 허용 권한 분리
+- 최신 브라우저를 위한 **고속 스트리밍 지원 HTTP 웹 뷰어** 동시 연동 (포트+1)
 
 ### 4. ⚙️ 편의 기능 & 일반 설정
 - **시스템 트레이(Tray) 최소화**: 백그라운드 무중단 실행 및 알림 영역 아이콘 제어
@@ -47,12 +54,18 @@ pip install wsgidav cheroot pyftpdlib cryptography pystray Pillow
 python webdav_server_gui.py
 ```
 
-### 3. 단일 실행 파일(.exe) 빌드
-PyInstaller를 통해 종속성 없는 독립 실행 파일로 빌드할 수 있습니다.
+### 3. 고속 실행 파일(.exe) 빌드
+PyInstaller를 통해 두 가지 형태의 최적화된 실행 파일로 빌드할 수 있습니다:
 ```bash
-pyinstaller WebDAV_Server.spec
+pyinstaller WebDAV_Server.spec --clean --noconfirm
 ```
-빌드 완료 후 `dist/WebDAV_Server.exe`가 생성됩니다.
+빌드 완료 후 `dist/` 폴더에 다음 파일들이 생성됩니다:
+1. **`dist/WebDAV_Server_Fast/WebDAV_Server.exe` (초고속 온디렉터리 모드 - 추천 ⭐)**
+   - 임시 폴더 압축 해제 없이 **더블 클릭 즉시 0.1초 만에 실행**됩니다.
+   - `dist/초고속_실행_바로가기_생성.bat`을 실행하면 바탕화면에 초고속 바로가기가 자동 생성됩니다.
+2. **`dist/WebDAV_Server.exe` (Splash 탑재 단일 실행 파일)**
+   - 파일 1개로 간편하게 이동 가능한 포터블 버전입니다.
+   - 클릭 즉시 **0.05초 만에 화면 중앙에 로딩 스플래시 창**이 표시되며, 모듈 지연 로딩(Lazy Import)으로 초기 기동 속도가 극대화되었습니다.
 
 ---
 

@@ -1,5 +1,6 @@
 import os
 import sys
+from typing import Dict, Optional, Tuple, Any, List
 import json
 import threading
 import socket
@@ -19,19 +20,7 @@ from tkinter import filedialog, messagebox, ttk
 import winreg
 import pystray
 from PIL import Image, ImageDraw
-from wsgidav.wsgidav_app import WsgiDAVApp
-from cheroot import wsgi
-from cheroot.ssl.builtin import BuiltinSSLAdapter
-
-from cryptography import x509
-from cryptography.x509.oid import NameOID
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-
-# pyftpdlib 라이브러리
-from pyftpdlib.authorizers import DummyAuthorizer
-from pyftpdlib.handlers import FTPHandler
-from pyftpdlib.servers import FTPServer
+# pyftpdlib 라이브러리 (필수 기본 클래스만 선언 또는 지연 로딩)
 from pyftpdlib.filesystems import AbstractedFS
 
 # HTTP 서버
@@ -85,6 +74,11 @@ DEFAULT_KEY_FILE = os.path.join(SSL_DIR, "server.key")
 
 def generate_self_signed_cert(cert_path=DEFAULT_CERT_FILE, key_path=DEFAULT_KEY_FILE, san_ips=None):
     """2048-bit RSA 자체 서명 SSL 인증서 및 개인키 자동 생성 (유효기간 10년)"""
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
     os.makedirs(os.path.dirname(os.path.abspath(cert_path)), exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(key_path)), exist_ok=True)
 
@@ -145,6 +139,7 @@ def get_cert_info(cert_path):
     if not cert_path or not os.path.exists(cert_path):
         return None
     try:
+        from cryptography import x509
         with open(cert_path, "rb") as f:
             cert_data = f.read()
         cert = x509.load_pem_x509_certificate(cert_data)
@@ -266,13 +261,61 @@ class MultiFolderFS(AbstractedFS):
 
 
 # ==============================================================================
-# HTTP 웹 파일 탐색 및 다운로드 핸들러
+# 미디어 스트리밍 MIME 및 확장자 정의
+# ==============================================================================
+MEDIA_MIMETYPES = {
+    # 동영상 (Video)
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".mkv": "video/x-matroska",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo",
+    ".wmv": "video/x-ms-wmv",
+    ".flv": "video/x-flv",
+    ".ts": "video/mp2t",
+    ".m2ts": "video/mp2t",
+    ".3gp": "video/3gpp",
+    ".ogv": "video/ogg",
+    # 음원 (Audio)
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".flac": "audio/flac",
+    ".aac": "audio/aac",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".opus": "audio/opus",
+    ".wma": "audio/x-ms-wma",
+    # 자막 및 텍스트 (Subtitles)
+    ".vtt": "text/vtt; charset=utf-8",
+    ".srt": "text/plain; charset=utf-8",
+    ".smi": "text/plain; charset=utf-8",
+    ".ass": "text/plain; charset=utf-8",
+    ".ssa": "text/plain; charset=utf-8",
+    # 이미지 (Image)
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+}
+
+VIDEO_EXTENSIONS = {'.mp4', '.m4v', '.mkv', '.webm', '.mov', '.avi', '.wmv', '.flv', '.ts', '.m2ts', '.3gp', '.ogv'}
+AUDIO_EXTENSIONS = {'.mp3', '.m4a', '.flac', '.aac', '.wav', '.ogg', '.oga', '.opus', '.wma'}
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'}
+
+
+# ==============================================================================
+# HTTP 웹 파일 탐색 및 스트리밍 핸들러 (RFC 7233 Range 지원)
 # ==============================================================================
 class MultiFolderHTTPHandler(SimpleHTTPRequestHandler):
-    folder_mapping = {}  # { 'virtual_name': 'real_os_path', ... }
-    auth_credentials = None  # (username, password) or None
-    serve_index_html = True  # True이면 index.html 존재 시 웹페이지 서빙, False이면 파일 목록 표시
-    server_title = "🌐 HTTP 파일 서버"
+    protocol_version = "HTTP/1.1"
+    folder_mapping: Dict[str, str] = {}  # { 'virtual_name': 'real_os_path', ... }
+    auth_credentials: Optional[Tuple[str, str]] = None  # (username, password) or None
+    serve_index_html: bool = True  # True이면 index.html 존재 시 웹페이지 서빙, False이면 파일 목록 표시
+    server_title: str = "🌐 HTTP 파일 서버"
 
     def log_message(self, format, *args):
         # 표준 출력 로그 노이즈 최소화
@@ -304,9 +347,18 @@ class MultiFolderHTTPHandler(SimpleHTTPRequestHandler):
             "<body style='font-family:sans-serif; text-align:center; padding:50px;'>"
             "<h2>🔒 인증이 필요합니다.</h2><p>아이디와 비밀번호를 입력해주세요.</p></body></html>"
         )
-        self.wfile.write(html_msg.encode('utf-8'))
+        try:
+            self.wfile.write(html_msg.encode('utf-8'))
+        except Exception:
+            pass
+
+    def do_HEAD(self):
+        self._handle_request(is_head=True)
 
     def do_GET(self):
+        self._handle_request(is_head=False)
+
+    def _handle_request(self, is_head: bool = False):
         if not self.check_auth():
             self.require_auth()
             return
@@ -317,12 +369,12 @@ class MultiFolderHTTPHandler(SimpleHTTPRequestHandler):
         # 1. 단일 폴더이면서 virtual name이 없는 경우 (또는 1개 폴더 직결)
         if len(self.folder_mapping) == 1 and "" in self.folder_mapping:
             real_base = self.folder_mapping[""]
-            self.serve_single_folder_path(real_base, clean_path, url_path)
+            self.serve_single_folder_path(real_base, clean_path, url_path, is_head=is_head)
             return
 
         # 2. 다중 폴더 가상 루트
         if not clean_path:
-            self.render_virtual_root()
+            self.render_virtual_root(is_head=is_head)
             return
 
         parts = clean_path.split('/')
@@ -339,23 +391,23 @@ class MultiFolderHTTPHandler(SimpleHTTPRequestHandler):
                     self.end_headers()
                     return
 
-                # index.html 또는 index.htm 파일이 있고 serve_index_html이 활성화된 경우에만 우선 서빙
+                # index.html 파일이 있고 serve_index_html이 켜진 경우에만 직접 서빙
                 if self.serve_index_html:
                     for index_file in ("index.html", "index.htm"):
                         index_path = os.path.join(real_target, index_file)
                         if os.path.isfile(index_path):
-                            self.send_file(index_path)
+                            self.send_file(index_path, is_head=is_head)
                             return
 
-                self.render_directory(vname, rel_parts, real_target)
+                self.render_directory(vname, rel_parts, real_target, is_head=is_head)
                 return
             elif os.path.isfile(real_target):
-                self.send_file(real_target)
+                self.send_file(real_target, is_head=is_head)
                 return
 
         self.send_error(404, "File Not Found")
 
-    def serve_single_folder_path(self, real_base, clean_path, url_path):
+    def serve_single_folder_path(self, real_base, clean_path, url_path, is_head: bool = False):
         real_target = os.path.normpath(os.path.join(real_base, *clean_path.split('/'))) if clean_path else real_base
         if os.path.isdir(real_target):
             if not url_path.endswith('/'):
@@ -364,22 +416,21 @@ class MultiFolderHTTPHandler(SimpleHTTPRequestHandler):
                 self.end_headers()
                 return
 
-            # index.html 또는 index.htm 파일이 있고 serve_index_html이 활성화된 경우에만 우선 서빙
             if self.serve_index_html:
                 for index_file in ("index.html", "index.htm"):
                     index_path = os.path.join(real_target, index_file)
                     if os.path.isfile(index_path):
-                        self.send_file(index_path)
+                        self.send_file(index_path, is_head=is_head)
                         return
 
             rel_parts = clean_path.split('/') if clean_path else []
-            self.render_directory("", rel_parts, real_target)
+            self.render_directory("", rel_parts, real_target, is_head=is_head)
         elif os.path.isfile(real_target):
-            self.send_file(real_target)
+            self.send_file(real_target, is_head=is_head)
         else:
             self.send_error(404, "File Not Found")
 
-    def render_virtual_root(self):
+    def render_virtual_root(self, is_head: bool = False):
         title = html.escape(self.server_title)
         body = f"""<!DOCTYPE html>
 <html lang="ko">
@@ -428,9 +479,13 @@ p.desc {{ margin: 0 0 20px 0; color: #94a3b8; font-size: 14px; }}
         self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
         self.send_header('Pragma', 'no-cache')
         self.end_headers()
-        self.wfile.write(encoded)
+        if not is_head:
+            try:
+                self.wfile.write(encoded)
+            except Exception:
+                pass
 
-    def render_directory(self, vname, rel_parts, real_target):
+    def render_directory(self, vname, rel_parts, real_target, is_head: bool = False):
         try:
             entries = os.listdir(real_target)
         except OSError:
@@ -476,21 +531,34 @@ p.desc {{ margin: 0 0 20px 0; color: #94a3b8; font-size: 14px; }}
 <style>
 * {{ box-sizing: border-box; }}
 body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 40px 20px; background: #0f172a; color: #f8fafc; }}
-.container {{ max-width: 950px; margin: 0 auto; }}
+.container {{ max-width: 1000px; margin: 0 auto; }}
 .card {{ background: #1e293b; border-radius: 12px; padding: 24px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.3); border: 1px solid #334155; }}
 .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 16px; margin-bottom: 16px; flex-wrap: wrap; gap: 10px; }}
 h2 {{ margin: 0; color: #38bdf8; font-size: 20px; word-break: break-all; }}
-.btn {{ text-decoration: none; padding: 8px 14px; background: #334155; color: #f8fafc; border-radius: 6px; font-size: 14px; font-weight: 500; border: 1px solid #475569; transition: background 0.2s; }}
-.btn:hover {{ background: #475569; color: #38bdf8; }}
+.btn {{ text-decoration: none; padding: 6px 12px; background: #334155; color: #f8fafc; border-radius: 6px; font-size: 13px; font-weight: 500; border: 1px solid #475569; transition: all 0.2s; display: inline-flex; align-items: center; gap: 4px; }}
+.btn:hover {{ background: #475569; color: #38bdf8; border-color: #38bdf8; }}
+.btn-play {{ background: #0284c7; color: #fff; border-color: #38bdf8; font-weight: 600; cursor: pointer; }}
+.btn-play:hover {{ background: #0369a1; transform: scale(1.02); }}
 table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
 th {{ text-align: left; padding: 12px 10px; border-bottom: 1px solid #475569; color: #94a3b8; font-size: 14px; }}
-td {{ padding: 12px 10px; border-bottom: 1px solid #334155; }}
+td {{ padding: 10px; border-bottom: 1px solid #334155; vertical-align: middle; }}
 tr:hover td {{ background: #243248; }}
 a.item-link {{ text-decoration: none; color: #f8fafc; font-weight: 500; display: inline-flex; align-items: center; gap: 8px; word-break: break-all; }}
 a.item-link:hover {{ color: #38bdf8; }}
 .size {{ color: #94a3b8; font-size: 13px; text-align: right; white-space: nowrap; }}
-.time {{ color: #64748b; font-size: 13px; text-align: right; white-space: nowrap; }}
+.action {{ text-align: right; white-space: nowrap; }}
 .empty {{ text-align: center; color: #64748b; padding: 30px; }}
+
+/* 스트리밍 모달 */
+.modal-overlay {{ display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.85); z-index: 9999; justify-content: center; align-items: center; backdrop-filter: blur(4px); }}
+.modal-box {{ background: #1e293b; border: 1px solid #475569; border-radius: 12px; max-width: 900px; width: 95%; max-height: 90vh; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 20px 40px rgba(0,0,0,0.6); }}
+.modal-top {{ display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; border-bottom: 1px solid #334155; background: #0f172a; }}
+.modal-top h3 {{ margin: 0; font-size: 16px; color: #38bdf8; word-break: break-all; }}
+.modal-close-btn {{ background: transparent; border: none; color: #94a3b8; font-size: 20px; cursor: pointer; padding: 0 4px; transition: color 0.2s; }}
+.modal-close-btn:hover {{ color: #ef4444; }}
+.modal-body {{ padding: 16px; display: flex; justify-content: center; align-items: center; background: #000; }}
+.modal-foot {{ display: flex; justify-content: space-between; align-items: center; padding: 12px 18px; border-top: 1px solid #334155; background: #0f172a; flex-wrap: wrap; gap: 8px; }}
+.modal-info {{ color: #10b981; font-size: 12px; font-weight: 500; }}
 </style>
 </head>
 <body>
@@ -508,21 +576,37 @@ a.item-link:hover {{ color: #38bdf8; }}
 <thead>
     <tr>
         <th>이름</th>
-        <th style="text-align:right">크기</th>
+        <th style="text-align:right; width: 110px;">크기</th>
+        <th style="text-align:right; width: 190px;">작업</th>
     </tr>
 </thead>
 <tbody>
 """
         if not entries:
-            body += """<tr><td colspan="2" class="empty">폴더가 비어 있습니다.</td></tr>"""
+            body += """<tr><td colspan="3" class="empty">폴더가 비어 있습니다.</td></tr>"""
 
         for entry in entries:
             entry_path = os.path.join(real_target, entry)
             is_dir = os.path.isdir(entry_path)
-            icon = "📁" if is_dir else "📄"
+            ext = os.path.splitext(entry)[1].lower() if not is_dir else ""
+
+            if is_dir:
+                icon = "📁"
+            elif ext in VIDEO_EXTENSIONS:
+                icon = "🎬"
+            elif ext in AUDIO_EXTENSIONS:
+                icon = "🎵"
+            elif ext in IMAGE_EXTENSIONS:
+                icon = "🖼️"
+            else:
+                icon = "📄"
+
             entry_url = curr_url_base + urllib.parse.quote(entry) + ("/" if is_dir else "")
+            escaped_entry = html.escape(entry)
+            js_escaped_name = entry.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
 
             size_str = "-"
+            actions_html = ""
             if not is_dir:
                 try:
                     size_bytes = os.path.getsize(entry_path)
@@ -530,7 +614,13 @@ a.item-link:hover {{ color: #38bdf8; }}
                 except OSError:
                     size_str = "알 수 없음"
 
-            escaped_entry = html.escape(entry)
+                if ext in VIDEO_EXTENSIONS:
+                    actions_html = f"""<button class="btn btn-play" onclick="openPlayer('{entry_url}', '{js_escaped_name}', 'video')">▶ 재생</button> <a href="{entry_url}" class="btn" download>⬇ 다운로드</a>"""
+                elif ext in AUDIO_EXTENSIONS:
+                    actions_html = f"""<button class="btn btn-play" onclick="openPlayer('{entry_url}', '{js_escaped_name}', 'audio')">▶ 재생</button> <a href="{entry_url}" class="btn" download>⬇ 다운로드</a>"""
+                else:
+                    actions_html = f"""<a href="{entry_url}" class="btn" download>⬇ 다운로드</a>"""
+
             body += f"""    <tr>
         <td>
             <a href="{entry_url}" class="item-link">
@@ -539,12 +629,67 @@ a.item-link:hover {{ color: #38bdf8; }}
             </a>
         </td>
         <td class="size">{size_str}</td>
+        <td class="action">{actions_html}</td>
     </tr>\n"""
 
         body += """</tbody>
 </table>
 </div>
 </div>
+
+<!-- 동영상/오디오 초고속 인라인 스트리밍 모달 -->
+<div id="mediaModal" class="modal-overlay" onclick="if(event.target===this)closePlayer()">
+    <div class="modal-box">
+        <div class="modal-top">
+            <h3 id="modalTitle">미디어 스트리밍</h3>
+            <button class="modal-close-btn" onclick="closePlayer()" title="닫기 (ESC)">✕</button>
+        </div>
+        <div class="modal-body" id="playerWrap"></div>
+        <div class="modal-foot">
+            <span class="modal-info">⚡ 고속 HTTP Range(206) 즉각 시크(Seek) 스트리밍 활성화됨</span>
+            <div>
+                <a id="modalDlBtn" href="#" class="btn" download>⬇ 파일 다운로드</a>
+                <button class="btn" onclick="closePlayer()" style="margin-left: 6px;">닫기</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+function openPlayer(url, title, type) {
+    var modal = document.getElementById('mediaModal');
+    var modalTitle = document.getElementById('modalTitle');
+    var wrap = document.getElementById('playerWrap');
+    var dl = document.getElementById('modalDlBtn');
+
+    modalTitle.textContent = (type === 'video' ? '🎬 ' : '🎵 ') + title;
+    dl.href = url;
+
+    if (type === 'video') {
+        wrap.innerHTML = '<video id="activeMedia" controls autoplay preload="metadata" style="width:100%; max-height:72vh; outline:none;"><source src="' + url + '">브라우저가 HTML5 비디오 스트리밍을 지원하지 않습니다.</video>';
+    } else {
+        wrap.innerHTML = '<audio id="activeMedia" controls autoplay preload="metadata" style="width:90%; padding:20px 0;"><source src="' + url + '">브라우저가 HTML5 오디오 스트리밍을 지원하지 않습니다.</audio>';
+    }
+    modal.style.display = 'flex';
+}
+
+function closePlayer() {
+    var modal = document.getElementById('mediaModal');
+    var wrap = document.getElementById('playerWrap');
+    var media = document.getElementById('activeMedia');
+    if (media) {
+        media.pause();
+        media.removeAttribute('src');
+        media.load();
+    }
+    wrap.innerHTML = '';
+    modal.style.display = 'none';
+}
+
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') closePlayer();
+});
+</script>
 </body>
 </html>"""
         encoded = body.encode('utf-8')
@@ -554,7 +699,11 @@ a.item-link:hover {{ color: #38bdf8; }}
         self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
         self.send_header('Pragma', 'no-cache')
         self.end_headers()
-        self.wfile.write(encoded)
+        if not is_head:
+            try:
+                self.wfile.write(encoded)
+            except Exception:
+                pass
 
     def format_file_size(self, size_bytes):
         for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
@@ -563,37 +712,137 @@ a.item-link:hover {{ color: #38bdf8; }}
             size_bytes /= 1024.0
         return f"{size_bytes:.1f} PB"
 
-    def send_file(self, file_path):
+    @staticmethod
+    def parse_byte_range(range_header: str, file_size: int) -> Optional[Tuple[int, int]]:
+        """HTTP Range 헤더(bytes=start-end) 파싱 헬퍼 (RFC 7233)"""
+        if not range_header or not range_header.startswith("bytes="):
+            return None
+        range_spec = range_header[6:].strip()
+        if "," in range_spec:
+            range_spec = range_spec.split(",")[0].strip()
+        parts = range_spec.split("-")
+        if len(parts) != 2:
+            return None
+        start_str, end_str = parts[0].strip(), parts[1].strip()
+        if not start_str and not end_str:
+            return None
         try:
+            if not start_str:  # suffix byte range: -500 (끝에서 500바이트)
+                suffix_len = int(end_str)
+                if suffix_len <= 0:
+                    return None
+                start = max(0, file_size - suffix_len)
+                end = file_size - 1
+            elif not end_str:  # prefix byte range: 500- (500부터 끝까지)
+                start = int(start_str)
+                end = file_size - 1
+            else:  # full byte range: 500-999
+                start = int(start_str)
+                end = int(end_str)
+
+            if start > end or start >= file_size or start < 0:
+                return None
+            end = min(end, file_size - 1)
+            return (start, end)
+        except ValueError:
+            return None
+
+    def get_custom_content_type(self, file_path: str) -> str:
+        """미디어 스트리밍 최적화 Content-Type 결정"""
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in MEDIA_MIMETYPES:
+            return MEDIA_MIMETYPES[ext]
+        ctype = self.guess_type(file_path)
+        if ctype.startswith("text/") or ctype in ("application/javascript", "application/json"):
+            ctype += "; charset=utf-8"
+        return ctype
+
+    def send_file(self, file_path: str, is_head: bool = False):
+        """HTTP Range (206 Partial Content) 및 대용량 스트리밍 최적 파일 전송"""
+        try:
+            file_size = os.path.getsize(file_path)
             f = open(file_path, 'rb')
         except OSError:
             self.send_error(404, "File Not Found")
             return
 
         try:
-            fs = os.fstat(f.fileno())
-            self.send_response(200)
-            ctype = self.guess_type(file_path)
-            if ctype.startswith("text/") or ctype in ("application/javascript", "application/json"):
-                ctype += "; charset=utf-8"
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(fs.st_size))
-            self.send_header("Last-Modified", self.date_time_string(fs.st_mtime))
+            ctype = self.get_custom_content_type(file_path)
             fn = os.path.basename(file_path)
             encoded_fn = urllib.parse.quote(fn)
+
+            range_header = self.headers.get("Range")
+            byte_range = None
+            if range_header:
+                byte_range = self.parse_byte_range(range_header, file_size)
+                if byte_range is None and range_header.startswith("bytes="):
+                    # 범위를 벗어난 잘못된 Range 요청 (416 Range Not Satisfiable)
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{file_size}")
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+
+            if byte_range is not None:
+                start, end = byte_range
+                content_length = end - start + 1
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+                self.send_header("Content-Length", str(content_length))
+            else:
+                start = 0
+                end = file_size - 1
+                content_length = file_size
+                self.send_response(200)
+                self.send_header("Content-Length", str(content_length))
+
+            self.send_header("Content-Type", ctype)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Last-Modified", self.date_time_string(os.path.getmtime(file_path)))
             self.send_header("Content-Disposition", f"inline; filename*=UTF-8''{encoded_fn}")
+            # CORS 헤더 (웹 플레이어, 외부 기기, 모바일 앱 연동 지원)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Range, Authorization, Content-Type")
+            self.send_header("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges")
+            self.send_header("Cache-Control", "public, max-age=3600")
             self.end_headers()
-            self.copyfile(f, self.wfile)
+
+            if is_head:
+                return
+
+            if start > 0:
+                f.seek(start)
+
+            # 초고속 스트리밍 버퍼 복사 (128KB 단위)
+            chunk_size = 131072
+            bytes_left = content_length
+            while bytes_left > 0:
+                to_read = min(chunk_size, bytes_left)
+                data = f.read(to_read)
+                if not data:
+                    break
+                try:
+                    self.wfile.write(data)
+                    bytes_left -= len(data)
+                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, socket.error):
+                    # 플레이어가 시크(Seek)하거나 닫은 경우 소켓 즉시 종료하여 스레드 반환
+                    break
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, socket.error):
+            pass
+        except Exception:
+            pass
         finally:
             f.close()
 
 
 class FTPWebHandler(MultiFolderHTTPHandler):
     """웹 브라우저(Chrome/Edge 등)에서 FTP 공유 폴더를 열 수 있도록 서빙하는 웹 핸들러"""
-    folder_mapping = {}
-    auth_credentials = None
-    serve_index_html = False  # FTP는 파일 탐색/전송이 목적이므로 index.html이 있어도 파일 목록을 기본 표시
-    server_title = "📡 FTP 웹 브라우저 뷰어"
+    folder_mapping: Dict[str, str] = {}
+    auth_credentials: Optional[Tuple[str, str]] = None
+    serve_index_html: bool = False  # FTP는 파일 탐색/전송이 목적이므로 index.html이 있어도 파일 목록을 기본 표시
+    server_title: str = "📡 FTP 웹 브라우저 뷰어"
 
 
 # ==============================================================================
@@ -605,6 +854,17 @@ class MultiServerGUI:
         self.root.title("통합 파일 서버 관리자 (WebDAV / HTTP / FTP)")
         self.root.geometry("640x870")
         self.root.minsize(580, 750)
+
+        # 윈도우 및 작업표시줄 아이콘 적용
+        icon_path = os.path.join(BASE_DIR, "app_icon.ico")
+        mei_pass = getattr(sys, "_MEIPASS", None)
+        if not os.path.exists(icon_path) and mei_pass:
+            icon_path = os.path.join(mei_pass, "app_icon.ico")
+        if os.path.exists(icon_path):
+            try:
+                self.root.iconbitmap(icon_path)
+            except Exception:
+                pass
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -634,13 +894,23 @@ class MultiServerGUI:
         self.custom_ssl_cert_var = tk.StringVar(value="")
         self.custom_ssl_key_var = tk.StringVar(value="")
 
+        # 폴더 목록 리스트박스 위젯 참조
+        self.webdav_listbox: tk.Listbox = None  # type: ignore
+        self.http_listbox: tk.Listbox = None  # type: ignore
+        self.ftp_listbox: tk.Listbox = None  # type: ignore
+
         self.create_widgets()
         self.load_config()
-        self.update_ssl_status_display()
-        self.setup_tray_icon()
+
+        # SSL 상태 조회 및 표시는 메인 창 렌더링 완료 후 지연 실행 (초기 기동 속도 최적화)
+        self.root.after(50, self.update_ssl_status_display)
 
         if start_in_tray:
             self.root.withdraw()
+            self.setup_tray_icon()
+        else:
+            # 트레이 아이콘은 창이 먼저 뜬 후 백그라운드로 등록하여 첫 창 표시 지연 제거
+            self.root.after(100, self.setup_tray_icon)
 
         # 백그라운드에서 IP 사전 조회
         self.start_ip_refresh()
@@ -981,6 +1251,26 @@ class MultiServerGUI:
             "port": port,
             "provider_mapping": provider_mapping,
             "verbose": 1,
+            "hotfixes": {
+                "emulate_win32_lastmod": False,
+                "re_encode_path_info": True,
+                "unquote_path_info": False,
+            },
+            "cors": {
+                "allow_origin": "*",
+                "allow_methods": [
+                    "GET", "HEAD", "OPTIONS", "PROPFIND", "PUT", "DELETE",
+                    "MKCOL", "COPY", "MOVE", "PROPPATCH", "LOCK", "UNLOCK"
+                ],
+                "allow_headers": [
+                    "Range", "Authorization", "Content-Type", "Depth",
+                    "If-Modified-Since", "If-None-Match", "Lock-Token", "Timeout"
+                ],
+                "expose_headers": [
+                    "Content-Range", "Content-Length", "Accept-Ranges", "ETag", "Lock-Token"
+                ],
+                "allow_credentials": True,
+            }
         }
         if u and p:
             config["simple_dc"] = {"user_mapping": {"*": {u: {"password": p}}}}
@@ -1012,8 +1302,26 @@ class MultiServerGUI:
 
         def _run():
             try:
+                # WsgiDAV 및 Cheroot 지연 로딩 (초기 GUI 기동 속도 극대화)
+                from wsgidav.wsgidav_app import WsgiDAVApp
+                from cheroot import wsgi
+                from cheroot.ssl.builtin import BuiltinSSLAdapter
+                import wsgidav.fs_dav_provider
+                import wsgidav.request_server
+
+                # WebDAV 동영상 스트리밍 및 고속 파일 전송을 위한 I/O 버퍼 확장 (기본 8KB -> 256KB)
+                wsgidav.fs_dav_provider.BUFFER_SIZE = 262144
+                wsgidav.request_server.DEFAULT_BLOCK_SIZE = 262144
+
                 app = WsgiDAVApp(config)
-                self.webdav_server = wsgi.Server(("0.0.0.0", port), app)
+                # 다중 동시 스트리밍 및 파일 전송 시 병목 방지를 위한 스레드 풀 확장 (numthreads=32)
+                self.webdav_server = wsgi.Server(
+                    ("0.0.0.0", port),
+                    app,
+                    numthreads=32,
+                    timeout=60,
+                    accepted_queue_size=64
+                )
 
                 # Cheroot error_log 안전 보호
                 def _safe_error_log(msg='', level=20, traceback=False):
@@ -1242,6 +1550,7 @@ class MultiServerGUI:
         def _run():
             try:
                 self.http_server = ThreadingHTTPServer(("0.0.0.0", port), MultiFolderHTTPHandler)
+                self.http_server.daemon_threads = True
                 if use_ssl:
                     cert_file, key_file = self.get_effective_ssl_files()
                     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -1473,6 +1782,11 @@ class MultiServerGUI:
 
         perm = "elradfmwM" if allow_write else "elr"
 
+        # pyftpdlib 모듈 지연 로딩 (초기 GUI 기동 속도 최적화)
+        from pyftpdlib.authorizers import DummyAuthorizer
+        from pyftpdlib.handlers import FTPHandler
+        from pyftpdlib.servers import FTPServer
+
         authorizer = DummyAuthorizer()
         
         # 단일 폴더일 때와 다중 폴더일 때 분기
@@ -1493,6 +1807,7 @@ class MultiServerGUI:
 
         class CustomHandler(FTPHandler):
             abstracted_fs = fs_class
+            passive_ports: Any = None
 
         pub_ip = self.fetch_public_ip()
         if pub_ip != "확인 불가":
@@ -1500,6 +1815,8 @@ class MultiServerGUI:
         CustomHandler.passive_ports = range(60000, 60020)
         CustomHandler.authorizer = authorizer
         CustomHandler.encoding = "utf-8"
+        CustomHandler.tcp_no_delay = True  # 패킷 대기 없는 즉시 전송 (Nagle 해제)
+        CustomHandler.timeout = 300
 
         # FTP용 웹 뷰어 핸들러 설정
         ftp_web_port = port + 1
@@ -1539,6 +1856,8 @@ class MultiServerGUI:
         def _run_ftp():
             try:
                 self.ftp_server = FTPServer(("0.0.0.0", port), CustomHandler)
+                self.ftp_server.max_cons = 256
+                self.ftp_server.max_cons_per_ip = 20
                 self.ftp_server.serve_forever()
             except Exception as e:
                 self.root.after(0, messagebox.showerror, "FTP 오류", f"FTP 서버 실행 실패:\n{e}")
@@ -1551,6 +1870,7 @@ class MultiServerGUI:
         def _run_web():
             try:
                 self.ftp_web_server = ThreadingHTTPServer(("0.0.0.0", ftp_web_port), FTPWebHandler)
+                self.ftp_web_server.daemon_threads = True
                 self.ftp_web_server.serve_forever()
             except Exception as e:
                 print(f"FTP Web Server error: {e}")
@@ -2053,7 +2373,22 @@ class MultiServerGUI:
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("mongchee.multifileservermanager.app")
+        except Exception:
+            pass
+
     start_in_tray = "--tray" in sys.argv
     root = tk.Tk()
+
+    # PyInstaller Splash Screen이 실행 중인 경우 닫고 메인 창으로 인계
+    try:
+        import pyi_splash  # type: ignore
+        pyi_splash.close()
+    except Exception:
+        pass
+
     app = MultiServerGUI(root, start_in_tray=start_in_tray)
     root.mainloop()
