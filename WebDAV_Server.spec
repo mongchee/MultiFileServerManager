@@ -9,7 +9,7 @@ datas = [
 binaries = []
 hiddenimports = []
 
-for mod in ['wsgidav', 'cheroot', 'pystray', 'pyftpdlib', 'cryptography']:
+for mod in ['wsgidav', 'cheroot', 'pystray', 'pyftpdlib', 'cryptography', 'defusedxml']:
     tmp_ret = collect_all(mod)
     datas += tmp_ret[0]
     binaries += tmp_ret[1]

@@ -1,3 +1,4 @@
+import io
 import os
 import sys
 from typing import Dict, Optional, Tuple, Any, List
@@ -32,11 +33,18 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# PyInstaller Windows GUI 모드(console=False)에서 sys.stdout과 sys.stderr가 None으로 설정되어
-# cheroot, wsgidav, http.server 등 내부에서 write() 호출 시 'NoneType' object has no attribute 'write'
-# 오류가 발생하는 문제를 원천 방지하는 안전 스트림 클래스
-class SafeStream:
+# PyInstaller Windows GUI 모드(console=False)에서 sys.stdout과 sys.stderr가 None으로 설정되거나
+# encoding 속성이 없어 cheroot, wsgidav, http.server, logging 등 내부에서 오류가 발생하는 문제를
+# 원천 방지하는 완벽한 표준 TextIO 호환 안전 스트림 클래스
+class SafeStream(io.TextIOBase):
+    encoding = "utf-8"
+    errors = "replace"
+    mode = "w"
+    name = "<SafeStream>"
+    closed = False
+
     def __init__(self, log_path=None):
+        super().__init__()
         self.log_path = log_path
         self._lock = threading.Lock()
 
@@ -47,10 +55,10 @@ class SafeStream:
             try:
                 with self._lock:
                     with open(self.log_path, "a", encoding="utf-8", errors="replace") as f:
-                        f.write(s)
+                        f.write(str(s))
             except Exception:
                 pass
-        return len(s)
+        return len(str(s))
 
     def flush(self):
         pass
@@ -58,10 +66,33 @@ class SafeStream:
     def isatty(self):
         return False
 
-if sys.stdout is None:
+    def writable(self):
+        return True
+
+    def readable(self):
+        return False
+
+    def seekable(self):
+        return False
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def fileno(self):
+        raise io.UnsupportedOperation("fileno is not supported")
+
+    def reconfigure(self, **kwargs):
+        pass
+
+if sys.stdout is None or not hasattr(sys.stdout, "encoding") or sys.stdout.encoding is None:
     sys.stdout = SafeStream(os.path.join(BASE_DIR, "server.log"))
-if sys.stderr is None:
+if sys.stderr is None or not hasattr(sys.stderr, "encoding") or sys.stderr.encoding is None:
     sys.stderr = SafeStream(os.path.join(BASE_DIR, "server_err.log"))
+if getattr(sys, "__stdout__", None) is None:
+    sys.__stdout__ = sys.stdout
+if getattr(sys, "__stderr__", None) is None:
+    sys.__stderr__ = sys.stderr
 
 CONFIG_FILE = os.path.join(BASE_DIR, "webdav_config.json")
 REG_KEY_NAME = "MultiFileServerManager"
@@ -1060,23 +1091,81 @@ class MultiServerGUI:
         frame = ttk.LabelFrame(parent, text=title)
         frame.pack(fill="both", expand=True, padx=10, pady=5)
 
-        listbox = tk.Listbox(frame, selectmode=tk.SINGLE, height=5)
-        listbox.pack(padx=8, pady=6, fill="both", expand=True)
+        # 리스트박스와 스크롤바 컨테이너
+        list_container = ttk.Frame(frame)
+        list_container.pack(fill="both", expand=True, padx=8, pady=4)
+
+        v_scroll = ttk.Scrollbar(list_container, orient="vertical")
+        h_scroll = ttk.Scrollbar(list_container, orient="horizontal")
+
+        listbox = tk.Listbox(
+            list_container,
+            selectmode=tk.SINGLE,
+            height=6,
+            yscrollcommand=v_scroll.set,
+            xscrollcommand=h_scroll.set,
+            activestyle="none"
+        )
+        v_scroll.config(command=listbox.yview)
+        h_scroll.config(command=listbox.xview)
+
+        v_scroll.pack(side="right", fill="y")
+        h_scroll.pack(side="bottom", fill="x")
+        listbox.pack(side="left", fill="both", expand=True)
+
         setattr(self, listbox_attr, listbox)
 
         btn_box = ttk.Frame(frame)
         btn_box.pack(fill="x", padx=8, pady=(0, 6))
 
         add_btn = ttk.Button(btn_box, text="➕ 폴더 추가", command=lambda: self.add_folder_to_list(folders_attr, listbox))
-        add_btn.pack(side="left", padx=(0, 5))
+        add_btn.pack(side="left", padx=(0, 4))
+
+        up_btn = ttk.Button(btn_box, text="▲ 위로", width=6, command=lambda: self.move_folder_up(folders_attr, listbox))
+        up_btn.pack(side="left", padx=(0, 2))
+
+        down_btn = ttk.Button(btn_box, text="▼ 아래로", width=6, command=lambda: self.move_folder_down(folders_attr, listbox))
+        down_btn.pack(side="left", padx=(0, 4))
 
         del_btn = ttk.Button(btn_box, text="🗑 선택 삭제", command=lambda: self.remove_folder_from_list(folders_attr, listbox))
-        del_btn.pack(side="left", padx=(0, 5))
+        del_btn.pack(side="left", padx=(0, 4))
 
         open_btn = ttk.Button(btn_box, text="📂 탐색기로 열기", command=lambda: self.open_selected_folder(listbox))
         open_btn.pack(side="left")
 
         return frame, add_btn, del_btn
+
+    def move_folder_up(self, folders_attr, listbox):
+        folders_list = getattr(self, folders_attr)
+        sel = listbox.curselection()
+        if not sel:
+            messagebox.showinfo("알림", "위로 이동할 폴더를 목록에서 선택해주세요.")
+            return
+        idx = sel[0]
+        if idx > 0:
+            folders_list[idx - 1], folders_list[idx] = folders_list[idx], folders_list[idx - 1]
+            listbox.delete(0, tk.END)
+            for f in folders_list:
+                listbox.insert(tk.END, f)
+            listbox.selection_set(idx - 1)
+            listbox.activate(idx - 1)
+            self.save_config()
+
+    def move_folder_down(self, folders_attr, listbox):
+        folders_list = getattr(self, folders_attr)
+        sel = listbox.curselection()
+        if not sel:
+            messagebox.showinfo("알림", "아래로 이동할 폴더를 목록에서 선택해주세요.")
+            return
+        idx = sel[0]
+        if idx < len(folders_list) - 1:
+            folders_list[idx + 1], folders_list[idx] = folders_list[idx], folders_list[idx + 1]
+            listbox.delete(0, tk.END)
+            for f in folders_list:
+                listbox.insert(tk.END, f)
+            listbox.selection_set(idx + 1)
+            listbox.activate(idx + 1)
+            self.save_config()
 
     def add_folder_to_list(self, folders_attr, listbox):
         folders_list = getattr(self, folders_attr)
@@ -1168,6 +1257,16 @@ class MultiServerGUI:
         ttk.Entry(url_frame, textvariable=self.webdav_public_url_var, state="readonly", width=40).grid(row=2, column=1, padx=5, pady=2)
         ttk.Button(url_frame, text="복사", command=lambda: self.copy_clipboard(self.webdav_public_url_var.get())).grid(row=2, column=2, padx=5, pady=2)
 
+        wd_tip_lbl = ttk.Label(
+            parent,
+            text="💡 다중 폴더 안내: 1번(첫 번째) 폴더는 기본 루트(/)로 직결되며, 각 폴더는 /[폴더명]으로도 개별 접속 가능합니다. (순서는 [▲ 위로] / [▼ 아래로] 버튼으로 자유롭게 변경 가능)",
+            foreground="#64748b",
+            font=("", 8),
+            wraplength=580,
+            justify="left"
+        )
+        wd_tip_lbl.pack(padx=10, pady=(2, 4), anchor="w")
+
         # 상태 및 개별 시작/중지
         ctrl_frame = ttk.Frame(parent)
         ctrl_frame.pack(fill="x", padx=10, pady=8)
@@ -1197,21 +1296,28 @@ class MultiServerGUI:
         folders = valid_folders if valid_folders is not None else self.webdav_folders
         if not folders:
             return mapping
+
+        # 첫 번째 폴더는 기본 루트(/)에 매핑 (단일/다중 공통 접근 편의)
         mapping["/"] = folders[0]
+
+        # 모든 등록된 폴더에 대해 개별 가상 마운트 포인트 생성
+        # WsgiDAV의 resolve_provider 소문자 매칭 버그를 방지하기 위해 마운트 키를 소문자로 정규화
+        used_mounts = {"/"}
         for path in folders:
-            folder_name = os.path.basename(path)
+            folder_name = os.path.basename(path).strip()
             if not folder_name:
                 clean_drive = path.replace(":\\", "").replace(":/", "").replace(":", "").replace("\\", "").replace("/", "")
                 folder_name = f"{clean_drive}_drive" if clean_drive else "root_drive"
-            mount_point = f"/{folder_name}"
-            orig = mount_point
+
+            base_mount = f"/{folder_name}".lower()
+            mount_point = base_mount
             counter = 1
-            while mount_point in mapping:
-                if mapping[mount_point] == path:
-                    break
-                mount_point = f"{orig}_{counter}"
+            while mount_point in used_mounts:
+                mount_point = f"{base_mount}_{counter}"
                 counter += 1
+            used_mounts.add(mount_point)
             mapping[mount_point] = path
+
         return mapping
 
     def start_webdav(self):
@@ -1314,6 +1420,12 @@ class MultiServerGUI:
                 wsgidav.request_server.DEFAULT_BLOCK_SIZE = 262144
 
                 app = WsgiDAVApp(config)
+
+                # 대소문자 혼용 클라이언트(Windows 탐색기, Cyberduck, RaiDrive 등) 및
+                # WsgiDAV 내부 resolve_provider 호환성을 위해 대소문자 키 모두 매핑 보강
+                for k, v in list(app.provider_map.items()):
+                    app.provider_map[k.lower()] = v
+
                 # 다중 동시 스트리밍 및 파일 전송 시 병목 방지를 위한 스레드 풀 확장 (numthreads=32)
                 self.webdav_server = wsgi.Server(
                     ("0.0.0.0", port),
