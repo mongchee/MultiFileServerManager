@@ -28,3 +28,4 @@ server.log
 server_err.log
 .vscode/
 .idea/
+pyrightconfig.json

@@ -41,7 +41,9 @@ class SafeStream(io.TextIOBase):
     errors = "replace"
     mode = "w"
     name = "<SafeStream>"
-    closed = False
+    @property
+    def closed(self) -> bool:
+        return False
 
     def __init__(self, log_path=None):
         super().__init__()
@@ -90,9 +92,9 @@ if sys.stdout is None or not hasattr(sys.stdout, "encoding") or sys.stdout.encod
 if sys.stderr is None or not hasattr(sys.stderr, "encoding") or sys.stderr.encoding is None:
     sys.stderr = SafeStream(os.path.join(BASE_DIR, "server_err.log"))
 if getattr(sys, "__stdout__", None) is None:
-    sys.__stdout__ = sys.stdout
+    setattr(sys, "__stdout__", sys.stdout)
 if getattr(sys, "__stderr__", None) is None:
-    sys.__stderr__ = sys.stderr
+    setattr(sys, "__stderr__", sys.stderr)
 
 CONFIG_FILE = os.path.join(BASE_DIR, "webdav_config.json")
 REG_KEY_NAME = "MultiFileServerManager"
@@ -289,6 +291,111 @@ class MultiFolderFS(AbstractedFS):
         if norm_p == norm_root:
             return os.stat(tempfile.gettempdir())
         return os.stat(path)
+
+
+# ==============================================================================
+# WebDAV 멀티 폴더 지원 가상 루트 프로바이더 (MultiFolderDAVProvider)
+# ==============================================================================
+from wsgidav.dav_provider import DAVProvider, DAVCollection, DAVError, HTTP_FORBIDDEN
+from wsgidav.fs_dav_provider import FolderResource, FileResource
+
+
+class MultiFolderDAVProvider(DAVProvider):
+    """다중 폴더 등록 시 WebDAV 기본 루트(/)에서 모든 공유 폴더와 하위 파일/폴더를 완벽 제공하는 프로바이더"""
+
+    def __init__(self, folder_mapping, readonly=False, fs_opts=None):
+        super().__init__()
+        self.readonly = readonly
+        self.fs_opts = fs_opts or {}
+        self.shadow_map = {}
+        self.shares = {}
+        self.name_map = {}
+        for name, p in folder_mapping.items():
+            clean = name.strip("/").strip()
+            if not clean:
+                continue
+            self.shares[clean] = os.path.abspath(p)
+            self.name_map[clean.lower()] = clean
+            self.name_map[urllib.parse.unquote(clean).lower()] = clean
+
+    def resolve_share(self, segment):
+        seg = segment.strip("/")
+        if seg in self.shares:
+            return seg
+        return self.name_map.get(seg.lower()) or self.name_map.get(urllib.parse.unquote(seg).lower())
+
+    def _loc_to_file_path(self, path, environ=None):
+        clean_path = path.strip("/")
+        if not clean_path:
+            return ""
+        parts = clean_path.split("/", 1)
+        share_key = self.resolve_share(parts[0])
+        if not share_key:
+            raise DAVError(HTTP_FORBIDDEN, f"Share not found: {parts[0]!r}")
+        base_dir = self.shares[share_key]
+        if len(parts) == 1:
+            return base_dir
+        unquoted_rel = urllib.parse.unquote(parts[1]).replace("/", os.sep)
+        file_path = os.path.normpath(os.path.join(base_dir, unquoted_rel))
+        try:
+            is_inside = (os.path.commonpath([os.path.normcase(base_dir), os.path.normcase(file_path)]) == os.path.normcase(base_dir))
+        except ValueError:
+            is_inside = False
+        if not is_inside:
+            raise DAVError(HTTP_FORBIDDEN, f"Access outside share is not allowed: {file_path!r}")
+        return file_path
+
+    def get_resource_inst(self, path, environ):
+        self._count_get_resource_inst += 1
+        clean_path = path.strip("/")
+        if not clean_path:
+            class RootCol(DAVCollection):
+                def __init__(self, p, env, prov):
+                    super().__init__(p, env)
+                    self.prov = prov
+
+                def get_member_names(self):
+                    return [k for k, p in self.prov.shares.items() if os.path.exists(p)]
+
+                def get_member(self, name):
+                    return self.prov.get_resource_inst("/" + name, self.environ)
+
+                def get_member_list(self):
+                    members = []
+                    for name in self.get_member_names():
+                        m = self.get_member(name)
+                        if m is not None:
+                            members.append(m)
+                    return members
+
+                def get_display_name(self):
+                    return "WebDAV Shares"
+
+            return RootCol("/", environ, self)
+
+        parts = clean_path.split("/", 1)
+        share_key = self.resolve_share(parts[0])
+        if not share_key:
+            return None
+
+        base_dir = self.shares[share_key]
+        if not os.path.exists(base_dir):
+            return None
+
+        if len(parts) == 1:
+            res = FolderResource("/" + share_key, environ, base_dir)
+            res.name = share_key
+            return res
+
+        file_path = self._loc_to_file_path(path, environ)
+        if not os.path.exists(file_path):
+            return None
+
+        unquoted_sub = urllib.parse.unquote(parts[1]).replace(os.sep, "/")
+        dav_path = "/" + share_key + "/" + unquoted_sub
+        if os.path.isdir(file_path):
+            return FolderResource(dav_path, environ, file_path)
+        return FileResource(dav_path, environ, file_path)
 
 
 # ==============================================================================
@@ -1259,7 +1366,7 @@ class MultiServerGUI:
 
         wd_tip_lbl = ttk.Label(
             parent,
-            text="💡 다중 폴더 안내: 1번(첫 번째) 폴더는 기본 루트(/)로 직결되며, 각 폴더는 /[폴더명]으로도 개별 접속 가능합니다. (순서는 [▲ 위로] / [▼ 아래로] 버튼으로 자유롭게 변경 가능)",
+            text="💡 다중 폴더 안내: 여러 폴더 등록 시 루트(/) 접속 시 모든 폴더가 한 화면에 표시되며, 각 폴더별(/[폴더명])로도 개별 접근 가능합니다. (단일 폴더는 루트로 직결)",
             foreground="#64748b",
             font=("", 8),
             wraplength=580,
@@ -1297,27 +1404,34 @@ class MultiServerGUI:
         if not folders:
             return mapping
 
-        # 첫 번째 폴더는 기본 루트(/)에 매핑 (단일/다중 공통 접근 편의)
-        mapping["/"] = folders[0]
+        # 1개 폴더만 등록된 경우: 해당 폴더를 루트(/) 및 /[폴더명]에 직접 매핑 (단일 폴더 편의성)
+        if len(folders) == 1:
+            mapping["/"] = folders[0]
+            vname = os.path.basename(folders[0]).strip()
+            if not vname:
+                clean_drive = folders[0].replace(":\\", "").replace(":/", "").replace(":", "").replace("\\", "").replace("/", "")
+                vname = f"{clean_drive}_drive" if clean_drive else "root_drive"
+            mapping[f"/{vname.lower()}"] = folders[0]
+            return mapping
 
-        # 모든 등록된 폴더에 대해 개별 가상 마운트 포인트 생성
-        # WsgiDAV의 resolve_provider 소문자 매칭 버그를 방지하기 위해 마운트 키를 소문자로 정규화
-        used_mounts = {"/"}
+        # 다중 폴더 등록 시: MultiFolderDAVProvider를 루트(/)에 등록하여
+        # 루트 접속 시 모든 공유 폴더 목록과 그 내부의 모든 하위 파일/폴더를 완벽 제공
+        virtual_shares = {}
         for path in folders:
             folder_name = os.path.basename(path).strip()
             if not folder_name:
                 clean_drive = path.replace(":\\", "").replace(":/", "").replace(":", "").replace("\\", "").replace("/", "")
                 folder_name = f"{clean_drive}_drive" if clean_drive else "root_drive"
 
-            base_mount = f"/{folder_name}".lower()
-            mount_point = base_mount
+            orig_name = folder_name
             counter = 1
-            while mount_point in used_mounts:
-                mount_point = f"{base_mount}_{counter}"
+            while folder_name in virtual_shares:
+                folder_name = f"{orig_name}_{counter}"
                 counter += 1
-            used_mounts.add(mount_point)
-            mapping[mount_point] = path
 
+            virtual_shares[folder_name] = path
+
+        mapping["/"] = MultiFolderDAVProvider(virtual_shares)
         return mapping
 
     def start_webdav(self):
@@ -1360,7 +1474,7 @@ class MultiServerGUI:
             "hotfixes": {
                 "emulate_win32_lastmod": False,
                 "re_encode_path_info": True,
-                "unquote_path_info": False,
+                "unquote_path_info": True,
             },
             "cors": {
                 "allow_origin": "*",
@@ -1412,19 +1526,32 @@ class MultiServerGUI:
                 from wsgidav.wsgidav_app import WsgiDAVApp
                 from cheroot import wsgi
                 from cheroot.ssl.builtin import BuiltinSSLAdapter
-                import wsgidav.fs_dav_provider
-                import wsgidav.request_server
+                import wsgidav.fs_dav_provider as fs_dav_provider
+                import wsgidav.request_server as request_server
 
                 # WebDAV 동영상 스트리밍 및 고속 파일 전송을 위한 I/O 버퍼 확장 (기본 8KB -> 256KB)
-                wsgidav.fs_dav_provider.BUFFER_SIZE = 262144
-                wsgidav.request_server.DEFAULT_BLOCK_SIZE = 262144
+                setattr(fs_dav_provider, "BUFFER_SIZE", 262144)
+                setattr(request_server, "DEFAULT_BLOCK_SIZE", 262144)
 
                 app = WsgiDAVApp(config)
 
                 # 대소문자 혼용 클라이언트(Windows 탐색기, Cyberduck, RaiDrive 등) 및
-                # WsgiDAV 내부 resolve_provider 호환성을 위해 대소문자 키 모두 매핑 보강
+                # URL 인코딩(%20 등) 공백/특수문자 호환성을 위해 대소문자 키와 URL 인코딩/디코딩 키 모두 매핑 보강
                 for k, v in list(app.provider_map.items()):
                     app.provider_map[k.lower()] = v
+                    quoted_k = urllib.parse.quote(k)
+                    app.provider_map[quoted_k] = v
+                    app.provider_map[quoted_k.lower()] = v
+                    unquoted_k = urllib.parse.unquote(k)
+                    app.provider_map[unquoted_k] = v
+                    app.provider_map[unquoted_k.lower()] = v
+
+                # 길이 역순으로 정렬하여 가장 구체적인 마운트 경로가 우선 매칭되도록 보장
+                app.sorted_share_list = sorted(
+                    list({s.lower() for s in app.provider_map.keys()}),
+                    key=len,
+                    reverse=True
+                )
 
                 # 다중 동시 스트리밍 및 파일 전송 시 병목 방지를 위한 스레드 풀 확장 (numthreads=32)
                 self.webdav_server = wsgi.Server(
@@ -1817,7 +1944,7 @@ class MultiServerGUI:
         else:
             ftp_url = f"ftp://127.0.0.1:{port}/"
         try:
-            os.system(f'start explorer "{ftp_url}"')
+            subprocess.Popen(["explorer.exe", ftp_url])
         except Exception as e:
             messagebox.showerror("오류", f"탐색기 실행 실패:\n{e}")
 
